@@ -185,7 +185,9 @@ func (p *planner) planApply() {
 		// Ensure any parallel apply is complete before starting the next one.
 		// This also limits how out of date our snapshot can be.
 		if planIndexCh != nil {
+			startBlock := time.Now()
 			idx := <-planIndexCh
+			metrics.MeasureSince(metricWaitTimeParallelApply, startBlock)
 			planIndexCh = nil
 			prevPlanResultIndex = max(prevPlanResultIndex, idx)
 			snap, err = p.snapshotMinIndex(prevPlanResultIndex, pending.plan.SnapshotIndex)
@@ -237,9 +239,24 @@ func (p *planner) snapshotMinIndex(prevPlanResultIndex, planSnapshotIndex uint64
 	return snap, err
 }
 
+// XXX: this represents the amount of time a plan takes to apply after
+// evaluation. Includes raft dispatch, signing, but not waiting on previous plan's
+// write to Raft or the Raft future we write
+var metricApplyPlan = []string{"nomad", "plan", "applyPlan"}
+
+// XXX: this represents the amount of time it takes to dispatch a Raft log
+// (limited by MaxAppendEntries)
+var metricApplyPlanBlockOnRaftDispatch = []string{"nomad", "plan", "applyPlanBlockOnRaftDispatch"}
+
+// XXX: this represents the amount of time a plan is waiting on the previous
+// plan to be committed to Raft
+var metricWaitTimeParallelApply = []string{"nomad", "plan", "applyPlanBlockOnParallelApply"}
+
 // applyPlan is used to apply the plan result and to return the alloc index
 func (p *planner) applyPlan(plan *structs.Plan, result *structs.PlanResult, snap *state.StateSnapshot) (raft.ApplyFuture, error) {
 	now := time.Now().UTC()
+	defer metrics.MeasureSince(metricApplyPlan, now)
+
 	unixNow := now.UnixNano()
 
 	job := plan.Job
@@ -319,10 +336,12 @@ func (p *planner) applyPlan(plan *structs.Plan, result *structs.PlanResult, snap
 	req.PreemptionEvals = evals
 
 	// Dispatch the Raft transaction
+	metricNow := time.Now().UTC()
 	future, err := p.srv.raftApplyFuture(structs.ApplyPlanResultsRequestType, &req)
 	if err != nil {
 		return nil, err
 	}
+	metrics.MeasureSince(metricApplyPlanBlockOnRaftDispatch, metricNow)
 
 	// Optimistically apply to our state view
 	if snap != nil {
@@ -379,7 +398,12 @@ func updateAllocTimestamps(allocations []*structs.Allocation, timestamp int64) {
 	}
 }
 
+var metricSignAllocIdentities = []string{"nomad", "plan", "signAllocIdentities"}
+
 func signAllocIdentities(signer claimSigner, job *structs.Job, allocations []*structs.Allocation, ns *structs.Namespace, now time.Time) error {
+	metricsNow := time.Now().UTC()
+	defer metrics.MeasureSince(metricSignAllocIdentities, metricsNow)
+
 	for _, alloc := range allocations {
 		if alloc.SignedIdentities == nil {
 			alloc.SignedIdentities = map[string]string{}

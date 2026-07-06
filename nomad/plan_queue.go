@@ -126,6 +126,9 @@ func (q *PlanQueue) Enqueue(plan *structs.Plan) (PlanFuture, error) {
 	return pending, nil
 }
 
+// XXX: this represents the amount of time a plan is waiting on previous plans
+var metricWaitTimeInPlanQueue = []string{"nomad", "plan", "plan_queue_wait_time"}
+
 // Dequeue is used to perform a blocking dequeue
 func (q *PlanQueue) Dequeue(timeout time.Duration) (*pendingPlan, error) {
 SCAN:
@@ -143,6 +146,7 @@ SCAN:
 		pending := raw.(*pendingPlan)
 		q.stats.Depth -= 1
 		q.l.Unlock()
+		defer metrics.MeasureSince(metricWaitTimeInPlanQueue, pending.enqueueTime)
 		return pending, nil
 	}
 	q.l.Unlock()

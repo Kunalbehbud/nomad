@@ -73,6 +73,7 @@ func (p *Plan) Submit(args *structs.PlanRequest, reply *structs.PlanResponse) er
 	defer p.srv.evalBroker.ResumeNackTimeout(id, token)
 
 	// Submit the plan to the queue
+
 	future, err := p.srv.planQueue.Enqueue(plan)
 	if err != nil {
 		return err
