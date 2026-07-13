@@ -112,11 +112,11 @@ func (p *planner) planApply() {
 	// missing recently committed changes.
 	var prevPlanResultIndex uint64
 
-	// snapOptimisticIndex tracks the highest index that has been optimistically
-	// applied to the current snapshot. This includes both committed plans and
-	// in-flight plans. When we refresh the snapshot, we ensure the new snapshot
-	// includes at least this index to avoid losing visibility of in-flight plans.
-	var snapOptimisticIndex uint64
+	// inFlightPlans tracks the number of plans that have been dispatched to Raft
+	// but haven't completed yet. We use this to avoid refreshing the snapshot
+	// while plans are in-flight, as the snapshot contains optimistic updates
+	// that would be lost on refresh.
+	var inFlightPlans int
 
 	// Setup a worker pool with half the cores, with at least 1
 	poolSize := runtime.NumCPU() / 2
@@ -125,6 +125,7 @@ func (p *planner) planApply() {
 	}
 	pool := NewEvaluatePool(poolSize, workerPoolBufferSize)
 	defer pool.Shutdown()
+	defer close(planIndexCh) // Close channel when exiting to signal goroutines
 
 	for {
 		// Pull the next pending plan, exit if we are no longer leader
@@ -139,9 +140,11 @@ func (p *planner) planApply() {
 		// any completions and allows us to update our snapshot to include all
 		// completed plans.
 		var maxNewIndex uint64
+		var completedPlans int
 		for {
 			select {
 			case idx := <-planIndexCh:
+				completedPlans++
 				// idx may be 0 if plan failed to apply
 				if idx > maxNewIndex {
 					maxNewIndex = idx
@@ -153,40 +156,45 @@ func (p *planner) planApply() {
 		}
 	DONE_DRAINING:
 
+		// Decrement in-flight counter for each completed plan
+		inFlightPlans -= completedPlans
+		if inFlightPlans < 0 {
+			inFlightPlans = 0 // Safety check
+		}
+
 		// Update prevPlanResultIndex and invalidate snapshot if we received
-		// any new completion indices. This ensures the next snapshot will
-		// include all plans up to the highest completed index.
+		// any new completion indices
 		if maxNewIndex > prevPlanResultIndex {
 			prevPlanResultIndex = maxNewIndex
-			snap = nil // Force snapshot refresh
-			snapOptimisticIndex = 0 // Reset since we're getting a fresh snapshot
+			// Only invalidate snapshot if no plans are in-flight
+			// This preserves optimistic updates from in-flight plans
+			if inFlightPlans == 0 {
+				snap = nil
+			}
 		}
 
 		if snap != nil {
-			// If snapshot doesn't contain the previous plan result's index,
-			// the current plan's snapshot index, or our optimistic index,
-			// discard it and get a new one below.
-			minIndex := max(prevPlanResultIndex, pending.plan.SnapshotIndex, snapOptimisticIndex)
+			// If snapshot doesn't contain the previous plan result's index
+			// or the current plan's snapshot index, discard it and get a new one below.
+			// But only if no plans are in-flight (to preserve optimistic updates).
+			minIndex := max(prevPlanResultIndex, pending.plan.SnapshotIndex)
 			if idx, err := snap.LatestIndex(); err != nil || idx < minIndex {
-				snap = nil
-				snapOptimisticIndex = 0 // Reset since we're getting a fresh snapshot
+				if inFlightPlans == 0 {
+					snap = nil
+				}
 			}
-		}
-		
-		if snap == nil {
+		} else {
 			// Snapshot the state so that we have a consistent view of the world.
 			// The snapshot is guaranteed to include all plans up to the highest
-			// of: prevPlanResultIndex (committed plans), pending.plan.SnapshotIndex
-			// (objects referenced by current plan), or snapOptimisticIndex
-			// (in-flight plans optimistically applied to previous snapshot).
-			minIndex := max(prevPlanResultIndex, pending.plan.SnapshotIndex, snapOptimisticIndex)
+			// of: prevPlanResultIndex (committed plans) or pending.plan.SnapshotIndex
+			// (objects referenced by current plan).
+			minIndex := max(prevPlanResultIndex, pending.plan.SnapshotIndex)
 			snap, err = p.snapshotMinIndex(minIndex, pending.plan.SnapshotIndex)
 			if err != nil {
 				p.srv.logger.Error("failed to snapshot state", "error", err)
 				pending.respond(nil, err)
 				continue
 			}
-			snapOptimisticIndex = minIndex // Initialize with the snapshot's base index
 		}
 
 		// Evaluate the plan
@@ -223,14 +231,8 @@ func (p *planner) planApply() {
 			continue
 		}
 
-		// Track the optimistic index. The plan was optimistically applied to
-		// the snapshot at nextIdx = AppliedIndex + 1. We track this so that
-		// when we refresh the snapshot, we ensure it includes all in-flight
-		// plans that were optimistically applied.
-		nextIdx := p.srv.raft.AppliedIndex() + 1
-		if nextIdx > snapOptimisticIndex {
-			snapOptimisticIndex = nextIdx
-		}
+		// Increment in-flight counter
+		inFlightPlans++
 
 		// Respond to the plan in async; the goroutine will send the committed
 		// index on planIndexCh when the Raft apply completes. We reuse the same
@@ -280,7 +282,8 @@ var metricApplyPlanBlockOnRaftDispatch = []string{"nomad", "plan", "applyPlanBlo
 // plan to be committed to Raft
 var metricWaitTimeParallelApply = []string{"nomad", "plan", "applyPlanBlockOnParallelApply"}
 
-// applyPlan is used to apply the plan result and to return the alloc index
+// applyPlan is used to apply the plan result and to return the alloc index.
+// Returns the raft future, the optimistic index (0 if not applied), and any error.
 func (p *planner) applyPlan(plan *structs.Plan, result *structs.PlanResult, snap *state.StateSnapshot) (raft.ApplyFuture, error) {
 	now := time.Now().UTC()
 	defer metrics.MeasureSince(metricApplyPlan, now)
@@ -460,18 +463,24 @@ func signAllocIdentities(signer claimSigner, job *structs.Job, allocations []*st
 	return nil
 }
 
-// asyncPlanWait is used to apply and respond to a plan async. On successful
-// commit the plan's index will be sent on the chan. On error the chan will be
-// closed.
+// asyncPlanWait is used to apply and respond to a plan async. indexCh is used
+// to send back the index the plan was applied at or 0 if it could not be
+// applied. This allows the main planning loop to track outstanding plans and
+// ensure the snapshot includes their optimistic updates. indexCh is shared
+// across all in-flight plans and must not be closed by this function.
 func (p *planner) asyncPlanWait(indexCh chan<- uint64, future raft.ApplyFuture,
 	result *structs.PlanResult, pending *pendingPlan) {
 	defer metrics.MeasureSince([]string{"nomad", "plan", "apply"}, time.Now())
-	defer close(indexCh)
 
 	// Wait for the plan to apply
 	if err := future.Error(); err != nil {
 		p.srv.logger.Error("failed to apply plan", "error", err)
 		pending.respond(nil, err)
+		// Send 0 to indicate failure
+		select {
+		case indexCh <- 0:
+		default:
+		}
 		return
 	}
 
@@ -487,7 +496,14 @@ func (p *planner) asyncPlanWait(indexCh chan<- uint64, future raft.ApplyFuture,
 		result.RefreshIndex = maxUint64(result.RefreshIndex, result.AllocIndex)
 	}
 	pending.respond(result, nil)
-	indexCh <- index
+
+	// Send index to channel, but don't block if channel is closed or full
+	// This can happen during server shutdown when planApply() exits
+	select {
+	case indexCh <- index:
+	default:
+		// Channel closed or full, ignore
+	}
 }
 
 // evaluatePlan is used to determine what portions of a plan

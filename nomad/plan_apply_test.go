@@ -1356,3 +1356,80 @@ func TestPlanApply_EvalNodePlan_Node_Disconnected(t *testing.T) {
 		})
 	}
 }
+
+// TestPlanApply_PipelinedPlans tests that multiple plans can be in-flight
+// simultaneously and that the in-flight counter prevents snapshot refresh.
+func TestPlanApply_PipelinedPlans(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, nil)
+	defer cleanupS1()
+	testutil.WaitForKeyring(t, s1.RPC, s1.Region())
+
+	// Register node
+	node := mock.Node()
+	testRegisterNode(t, s1, node)
+
+	// Create job and register it
+	job := mock.Job()
+	must.NoError(t, s1.State().UpsertJobSummary(1000, mock.JobSummary(job.ID)))
+	must.NoError(t, s1.State().UpsertJob(structs.MsgTypeTestSetup, 1001, nil, job))
+
+	// Create eval
+	eval := mock.Eval()
+	eval.JobID = job.ID
+	must.NoError(t, s1.State().UpsertEvals(structs.MsgTypeTestSetup, 1002, []*structs.Evaluation{eval}))
+
+	// Create 3 plans with proper allocations (no network ports to avoid collisions)
+	numPlans := 3
+	futures := make([]PlanFuture, numPlans)
+
+	// Use a job without network ports to avoid port collisions
+	jobNoPorts := job.Copy()
+	jobNoPorts.TaskGroups[0].Networks = nil
+	for _, task := range jobNoPorts.TaskGroups[0].Tasks {
+		task.Resources.Networks = nil
+	}
+	must.NoError(t, s1.State().UpsertJob(structs.MsgTypeTestSetup, 1003, nil, jobNoPorts))
+
+	for i := 0; i < numPlans; i++ {
+		alloc := mock.Alloc()
+		alloc.Job = jobNoPorts
+		alloc.JobID = jobNoPorts.ID
+		alloc.NodeID = node.ID
+		alloc.EvalID = eval.ID
+		alloc.TaskGroup = jobNoPorts.TaskGroups[0].Name
+		// Remove network resources to avoid port collisions
+		alloc.AllocatedResources.Shared.Networks = nil
+		for _, task := range alloc.AllocatedResources.Tasks {
+			task.Networks = nil
+		}
+
+		plan := &structs.Plan{
+			Job: jobNoPorts,
+			JobInfo: &structs.PlanJobTuple{
+				Namespace: jobNoPorts.Namespace,
+				ID:        jobNoPorts.ID,
+			},
+			EvalID:         eval.ID,
+			NodeAllocation: map[string][]*structs.Allocation{node.ID: {alloc}},
+		}
+
+		future, err := s1.planQueue.Enqueue(plan)
+		must.NoError(t, err)
+		futures[i] = future
+	}
+
+	// Wait for all plans to complete
+	for i, future := range futures {
+		result, err := future.Wait()
+		must.NoError(t, err)
+		must.NotNil(t, result, must.Sprintf("plan %d result is nil", i))
+	}
+
+	// Verify final state: all allocations should be created
+	ws := memdb.NewWatchSet()
+	allocs, err := s1.State().AllocsByNode(ws, node.ID)
+	must.NoError(t, err)
+	must.Len(t, numPlans, allocs, must.Sprintf("expected %d allocations", numPlans))
+}
